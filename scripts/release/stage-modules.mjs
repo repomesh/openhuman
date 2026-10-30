@@ -19,11 +19,14 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -55,6 +58,12 @@ const LIBRARY_EXTENSIONS = [".dll", ".so", ".dylib"];
 // each Windows host_key by its byte count and must be license-compliant for
 // app-local redistribution.
 const WINDOWS_APP_LOCAL_RUNTIME_FILES = ["vcruntime140.dll"];
+
+// PE/COFF machine type constants. tinybus loader admits a module by the host
+// candidate list, so an ARM64 bundle whose VC runtime is x64 (or vice versa)
+// resolves beside the module and still fails at `LoadLibraryExW`. We refuse
+// a mismatched source before copying so the pin-drift never ships.
+const PE_MACHINE = Object.freeze({ x64: 0x8664, arm64: 0xaa64 });
 
 /** The registry host key to bundle for a Node `platform`/`arch` pair. */
 export function defaultHostKey(platform = process.platform, arch = process.arch) {
@@ -158,6 +167,102 @@ function vcRuntimeArch(hostKey) {
 }
 
 /**
+ * Read a Windows PE's COFF machine field. Returns the raw UInt16 (e.g. 0x8664
+ * for x86_64, 0xAA64 for ARM64). The call opens the first 1 KiB of the file
+ * only; it never maps or executes the image.
+ */
+export function peMachine(path) {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(0x400);
+    const read = readSync(fd, buf, 0, buf.length, 0);
+    if (read < 0x40) throw new Error(`${path}: too small to be a PE image`);
+    if (buf.slice(0, 2).toString("ascii") !== "MZ") {
+      throw new Error(`${path}: missing MZ signature; not a PE image`);
+    }
+    const peOffset = buf.readUInt32LE(0x3c);
+    if (peOffset + 6 > read) throw new Error(`${path}: PE header past read window`);
+    if (buf.slice(peOffset, peOffset + 4).toString("latin1") !== "PE\0\0") {
+      throw new Error(`${path}: missing PE\\0\\0 signature at e_lfanew`);
+    }
+    return buf.readUInt16LE(peOffset + 4);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Verify `path` is Authenticode-signed by Microsoft on a Windows build host.
+ * On non-Windows build hosts this is a best-effort check we cannot run without
+ * `osslsigncode`, so we skip with a notice; the PE-machine check still runs
+ * and the `OPENHUMAN_VC_REDIST_DIR` contract requires an operator-sourced
+ * directory. On Windows this invokes `Get-AuthenticodeSignature` and refuses
+ * anything whose signer subject does not contain `CN=Microsoft`.
+ */
+export function assertMicrosoftSigned(path) {
+  // Test-only escape: setting OPENHUMAN_SKIP_AUTHENTICODE_CHECK=1 bypasses the
+  // signer check so unit tests can use a hand-rolled PE stub. This is NEVER
+  // set by any release workflow; a repository-wide guard
+  // (`scripts/ci/check-no-authenticode-skip.mjs` could enforce it) would fail
+  // CI if it ever appeared outside tests. Document as such.
+  if (process.env.OPENHUMAN_SKIP_AUTHENTICODE_CHECK === "1") {
+    console.warn(
+      `[bundled-modules] OPENHUMAN_SKIP_AUTHENTICODE_CHECK=1 — skipping Authenticode check for ${path}. ` +
+        `This must never be set by a release workflow.`,
+    );
+    return;
+  }
+  if (process.platform !== "win32") {
+    console.warn(
+      `[bundled-modules] skipping Authenticode check for ${path} on ${process.platform}; ` +
+        `verify the source matches a Microsoft redistributable on the build host.`,
+    );
+    return;
+  }
+  const subject = execFileSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ErrorActionPreference = 'Stop'; " +
+        "$s = Get-AuthenticodeSignature -LiteralPath $env:OPENHUMAN_AUTHENTICODE_PATH; " +
+        "if ($s.Status -ne 'Valid') { throw \"signature status $($s.Status): $($s.StatusMessage)\" }; " +
+        "if (-not $s.SignerCertificate) { throw 'no signer certificate' }; " +
+        "$s.SignerCertificate.Subject",
+    ],
+    {
+      env: { ...process.env, OPENHUMAN_AUTHENTICODE_PATH: path },
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+    },
+  ).trim();
+  if (!/CN=Microsoft/i.test(subject)) {
+    throw new Error(
+      `${path}: Authenticode signer is not Microsoft (${subject}); refusing to ship into bundled-modules.`,
+    );
+  }
+}
+
+/**
+ * Reject a staged VC runtime file whose arch does not match the module's.
+ * Shipping an x64 vcruntime140.dll beside an ARM64 module leaves the original
+ * `LoadLibraryExW` failure in place because the dynamic loader rejects a
+ * mismatched machine type — the fix must be arch-correct or it is no fix.
+ */
+export function assertRuntimeMatchesHost(path, hostKey) {
+  const arch = vcRuntimeArch(hostKey);
+  const expected = PE_MACHINE[arch];
+  const actual = peMachine(path);
+  if (actual !== expected) {
+    throw new Error(
+      `${path}: PE machine 0x${actual.toString(16)} does not match ${hostKey} (expected 0x${expected.toString(16)}). ` +
+        `Set OPENHUMAN_VC_REDIST_DIR to a directory with the ${arch} VC runtime.`,
+    );
+  }
+}
+
+/**
  * Resolve the directory on this build host that contains the Visual C++
  * redistributable DLLs for `hostKey`'s arch. Tried in order:
  *
@@ -198,10 +303,11 @@ export function findWindowsVcRuntimeDir(hostKey) {
   }
 
   if (process.platform !== "win32") {
+    const redistExe = arch === "arm64" ? "VC_redist.arm64.exe" : "VC_redist.x64.exe";
     throw new Error(
       `cannot locate the Windows VC++ runtime for ${hostKey} on a ${process.platform} build host. ` +
-        `Set OPENHUMAN_VC_REDIST_DIR to a directory containing ${WINDOWS_APP_LOCAL_RUNTIME_FILES.join(", ")} ` +
-        `(e.g. extracted from VC_redist.x64.exe), or stage on a Windows runner where VCToolsRedistDir is set.`,
+        `Set OPENHUMAN_VC_REDIST_DIR to a directory containing the ${arch} ${WINDOWS_APP_LOCAL_RUNTIME_FILES.join(", ")} ` +
+        `(e.g. extracted from ${redistExe}), or stage on a Windows runner where VCToolsRedistDir is set.`,
     );
   }
 
@@ -210,14 +316,35 @@ export function findWindowsVcRuntimeDir(hostKey) {
   if (!existsSync(vswhere)) {
     throw new Error(
       `${vswhere} not found; install Visual Studio Build Tools on the Windows runner, or set ` +
-        `OPENHUMAN_VC_REDIST_DIR to a directory containing ${WINDOWS_APP_LOCAL_RUNTIME_FILES.join(", ")}.`,
+        `OPENHUMAN_VC_REDIST_DIR to a directory containing the ${arch} ${WINDOWS_APP_LOCAL_RUNTIME_FILES.join(", ")}.`,
     );
   }
-  const installPath = execFileSync(vswhere, ["-latest", "-property", "installationPath"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf8",
-  }).trim();
-  if (!installPath) throw new Error("vswhere.exe reported no Visual Studio installation");
+  // -products * admits standalone Build Tools alongside the full IDE; -requires
+  // picks the install that actually has the C++ compiler for this target arch,
+  // not just the newest VS. Mirrors scripts/run-dev-win.sh:100.
+  const vswhereRequires =
+    arch === "arm64"
+      ? "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+      : "Microsoft.VisualStudio.Component.VC.Tools.x86.x64";
+  const installPath = execFileSync(
+    vswhere,
+    [
+      "-latest",
+      "-products",
+      "*",
+      "-requires",
+      vswhereRequires,
+      "-property",
+      "installationPath",
+    ],
+    { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" },
+  ).trim();
+  if (!installPath) {
+    throw new Error(
+      `vswhere.exe reported no Visual Studio installation with ${vswhereRequires}. ` +
+        `Install that workload, or set OPENHUMAN_VC_REDIST_DIR to a directory with the ${arch} VC runtime.`,
+    );
+  }
 
   const redistRoot = join(installPath, "VC", "Redist", "MSVC");
   if (!existsSync(redistRoot)) {
@@ -261,15 +388,28 @@ export function findWindowsVcRuntimeDir(hostKey) {
  * Place `WINDOWS_APP_LOCAL_RUNTIME_FILES` beside the staged module library on
  * Windows. No-op on other host_keys. Returns the staged absolute paths.
  *
+ * `libraryDir` is the directory holding the extracted native module library,
+ * not the archive's extraction root — a release may stage its library in a
+ * subdirectory (`librariesUnder` finds it), and the tinybus loader uses
+ * LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR which only resolves dependencies in that
+ * same subdirectory.
+ *
+ * Each candidate runtime file is validated BEFORE copy: its PE machine must
+ * match `hostKey`'s arch (so an x64 vcruntime140.dll never lands next to an
+ * ARM64 module), and on Windows build hosts its Authenticode signature must
+ * resolve to a Microsoft signer (defense in depth over `OPENHUMAN_VC_REDIST_DIR`,
+ * which an operator supplies). Both checks run against the resolved source,
+ * then the destination copy is re-checked to catch write-time tampering.
+ *
  * This closes issue #8499 / Sentry TAURI-RUST-14J5: before this step the
  * installer shipped tinyconnectors.dll (and every other `windows-*` tiny
- * module) alone; the tinybus loader uses LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
- * | LOAD_LIBRARY_SEARCH_SYSTEM32, which only resolves dependencies beside the
+ * module) alone; the tinybus loader uses LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+ * LOAD_LIBRARY_SEARCH_SYSTEM32, which only resolves dependencies beside the
  * module or in System32. On a user without VC++ 2015-2022 Redistributable
  * installed, VCRUNTIME140.dll is in neither place and `LoadLibraryExW`
  * returns NULL with GetLastError() == 126.
  */
-export function stageWindowsAppLocalRuntime(dir, hostKey) {
+export function stageWindowsAppLocalRuntime(libraryDir, hostKey) {
   if (!isWindowsHostKey(hostKey)) return [];
   const source = findWindowsVcRuntimeDir(hostKey);
   const copied = [];
@@ -278,8 +418,11 @@ export function stageWindowsAppLocalRuntime(dir, hostKey) {
     if (!existsSync(src)) {
       throw new Error(`VC runtime file missing: ${src}`);
     }
-    const dst = join(dir, name);
+    assertRuntimeMatchesHost(src, hostKey);
+    assertMicrosoftSigned(src);
+    const dst = join(libraryDir, name);
     copyFileSync(src, dst);
+    assertRuntimeMatchesHost(dst, hostKey);
     copied.push(dst);
   }
   return copied;
@@ -386,12 +529,15 @@ export async function stageModules({
       throw new Error(`${asset.id}: downloaded archive does not match the compiled registry pin`);
     }
     extractArchive(archive, dir);
-    if (librariesUnder(dir).length !== 1) {
+    const libraries = librariesUnder(dir);
+    if (libraries.length !== 1) {
       throw new Error(`${asset.id}: expected exactly one native library in the release archive`);
     }
-    // Windows-only: ship vcruntime140.dll beside the module (see
-    // stageWindowsAppLocalRuntime for the loader-flags rationale).
-    const runtime = stageWindowsAppLocalRuntime(dir, asset.hostKey);
+    // Windows-only: ship vcruntime140.dll in the SAME directory as the
+    // extracted module library — not necessarily `dir` itself, since an
+    // archive may stage the library in a subdirectory and the tinybus loader
+    // searches only beside the module (LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR).
+    const runtime = stageWindowsAppLocalRuntime(dirname(libraries[0]), asset.hostKey);
     if (!keepsArchive(asset.hostKey)) replaceArchiveWithMarker(archive, actual);
     const runtimeNote = runtime.length ? ` + ${runtime.length} runtime file(s)` : "";
     console.log(
