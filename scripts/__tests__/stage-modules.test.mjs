@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { gzipSync } from "node:zlib";
+import { crc32, gzipSync } from "node:zlib";
 import { test } from "node:test";
 
 import { readRegistrySource } from "../ci/self-hosted/test-module-assets.mjs";
@@ -489,15 +489,20 @@ test("stageWindowsAppLocalRuntime refuses a non-PE source file", () => {
 /**
  * Build a minimal valid ZIP containing one entry at `entryPath` with the
  * given uncompressed bytes. Hand-rolled so these tests do not depend on a
- * `zip` binary being on the runner.
+ * `zip` binary being on the runner. The CRC-32 of `payload` is written into
+ * both header slots — `unzip` on Linux/macOS verifies it and rejects a zero
+ * CRC, while Windows `System.IO.Compression.ZipFile` tolerates it (which is
+ * why an earlier revision passed on win32 and failed on every other CI leg).
  */
 function makeSingleEntryZip(entryPath, payload) {
   const name = Buffer.from(entryPath);
+  const payloadCrc = crc32(payload);
   const localHeader = Buffer.alloc(30);
   localHeader.writeUInt32LE(0x04034b50, 0);
   localHeader.writeUInt16LE(20, 4);
   localHeader.writeUInt16LE(0, 6);
   localHeader.writeUInt16LE(0, 8);
+  localHeader.writeUInt32LE(payloadCrc, 14);
   localHeader.writeUInt32LE(payload.length, 18);
   localHeader.writeUInt32LE(payload.length, 22);
   localHeader.writeUInt16LE(name.length, 26);
@@ -505,6 +510,7 @@ function makeSingleEntryZip(entryPath, payload) {
   central.writeUInt32LE(0x02014b50, 0);
   central.writeUInt16LE(20, 4);
   central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(payloadCrc, 16);
   central.writeUInt32LE(payload.length, 20);
   central.writeUInt32LE(payload.length, 24);
   central.writeUInt16LE(name.length, 28);
