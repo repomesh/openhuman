@@ -197,7 +197,9 @@ export function peMachine(path) {
  * `osslsigncode`, so we skip with a notice; the PE-machine check still runs
  * and the `OPENHUMAN_VC_REDIST_DIR` contract requires an operator-sourced
  * directory. On Windows this invokes `Get-AuthenticodeSignature` and refuses
- * anything whose signer subject does not contain `CN=Microsoft`.
+ * anything whose signer subject does not include the full Organization
+ * attribute `O=Microsoft Corporation` (matched anchored to its X.500
+ * comma delimiters — see the regex below for the rationale).
  */
 /**
  * Pick a PowerShell host for Authenticode validation. PowerShell 7 (`pwsh.exe`)
