@@ -63,12 +63,20 @@ jobs:
           # Pin exit codes we accept: 0 (success), 862/1641/3010 (install
           # succeeded but requested a reboot — fine for file-level use).
           $allowed = @(0, 862, 1641, 3010)
-          & $vsInstaller modify --quiet --norestart --wait `
-            --installPath "$installPath" `
-            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64
-          if ($allowed -notcontains $LASTEXITCODE) {
-            throw "vs_installer modify failed: $LASTEXITCODE"
+          # vs_installer.exe is a GUI-subsystem executable; the PowerShell call
+          # operator can return before it finishes, so $LASTEXITCODE would be
+          # read before the ARM64 CRT is actually on disk. Start-Process
+          # -Wait -PassThru blocks until the process exits and gives us the
+          # real exit code to gate on.
+          $proc = Start-Process -FilePath $vsInstaller -Wait -PassThru -NoNewWindow -ArgumentList @(
+            'modify',
+            '--quiet', '--norestart', '--wait',
+            '--installPath', $installPath,
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+          )
+          if ($allowed -notcontains $proc.ExitCode) {
+            throw "vs_installer modify failed: $($proc.ExitCode)"
           }
-          Write-Host "vs_installer modify finished (exit $LASTEXITCODE); ARM64 CRT should now be under VC\Redist\MSVC\*\arm64\"
+          Write-Host "vs_installer modify finished (exit $($proc.ExitCode)); ARM64 CRT should now be under VC\Redist\MSVC\*\arm64\"
       - name: Download and verify every bundled release
         run: node scripts/release/stage-modules.mjs --target ${{ matrix.target }}

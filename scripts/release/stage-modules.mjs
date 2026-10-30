@@ -264,9 +264,14 @@ export function assertMicrosoftSigned(path) {
       encoding: "utf8",
     },
   ).trim();
-  if (!/CN=Microsoft/i.test(subject)) {
+  // Match the WHOLE CN attribute. `/CN=Microsoft/i` is an unanchored
+  // substring — a subject like `CN=MicrosoftEvil` or `CN=Microsoft Foo Ltd`
+  // would slip through. The X.500 subject puts attributes between commas, so
+  // anchor on comma-or-start and comma-or-end. Microsoft's code-signing
+  // subject is consistently `CN=Microsoft Corporation`.
+  if (!/(?:^|,\s*)CN=Microsoft Corporation(?:,|$)/.test(subject)) {
     throw new Error(
-      `${path}: Authenticode signer is not Microsoft (${subject}); refusing to ship into bundled-modules.`,
+      `${path}: Authenticode signer is not "CN=Microsoft Corporation" (${subject}); refusing to ship into bundled-modules.`,
     );
   }
 }
