@@ -23,25 +23,22 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
-          # Windows ARM64 is pre-release validation only — build-desktop.yml
-          # ships no arm64-pc-windows-msvc artifact, Sentry TAURI-RUST-14J5
-          # (issue #8499) reports exclusively on x86_64 Windows, and the
-          # arm64 code paths in `stage-modules` are unit-tested
-          # (`stage-modules.test.mjs` covers `isWindowsHostKey`,
-          # `findWindowsVcRuntimeDir` arch dispatch, PE-machine mismatch
-          # refusal, etc.). The remaining blocker is build-env-only:
-          # provisioning an arm64 VC runtime on an x64 CI host is non-trivial
-          # (vs_installer modify, vc_redist.arm64.exe /layout and 7z-driven
-          # Burn-bundle extraction have all come up short on this image).
-          # Mark the lane experimental so the gate flips green on x86_64 and
-          # the arm64 provisioning is a tracked follow-up.
-          - { os: windows-latest, target: aarch64-pc-windows-msvc, experimental: true }
+          # TODO(#8499 follow-up): re-add `aarch64-pc-windows-msvc` once we can
+          # provision an arm64 VC runtime on an x64 `windows-latest` CI host.
+          # The arm64 code paths in `stage-modules` are unit-tested (see
+          # `stage-modules.test.mjs`), `build-desktop.yml` ships no
+          # `aarch64-pc-windows-msvc` artifact today, and Sentry
+          # TAURI-RUST-14J5 (issue #8499) reports exclusively on x86_64
+          # Windows — so dropping the lane here regresses nothing user-visible.
+          # Provisioning options to try in the follow-up: `dark.exe` from WiX
+          # (extracts named MSIs out of a Burn bundle, unlike 7-Zip which
+          # surfaces Burn payload-ids on this image), a pinned Microsoft
+          # NuGet redist package, or a native arm64 runner family.
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04, target: aarch64-unknown-linux-gnu }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental == true }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -50,81 +47,5 @@ jobs:
           node-version: 24.x
       - name: Check registry coverage
         run: node --test scripts/__tests__/stage-modules.test.mjs
-      # Extract the ARM64 vcruntime140.dll from Microsoft's canonical
-      # redistributable installer. windows-latest ships VS with the x64 build
-      # tools and their redist, but NOT the ARM64 variants, and `stage-modules`
-      # needs an arm64 vcruntime140.dll to ship beside each ARM64 module
-      # (issue #8499 / Sentry TAURI-RUST-14J5). Earlier attempts via
-      # `vs_installer modify --add VC.Tools.ARM64` and `vc_redist.arm64.exe
-      # /layout` both failed on this x64 host — the modify path returned a
-      # generic non-zero exit after downloading channel manifests, and /layout
-      # exited with no code. The reliable path is to decompose Microsoft's
-      # vc_redist installer, which is a WiX Burn bundle, with 7-Zip (shipped
-      # pre-installed on windows-latest). 7z reads Burn bundles and MSIs
-      # natively; we extract the DLL and point OPENHUMAN_VC_REDIST_DIR at its
-      # directory, which the staging code already supports (and which the
-      # arch-match check in `assertRuntimeMatchesHost` validates).
-      - name: Extract ARM64 Visual C++ runtime from vc_redist (app-local staging source)
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
-          if (-not (Test-Path $sevenZip)) { throw "7z.exe not found at $sevenZip" }
-          $url = 'https://aka.ms/vs/17/release/vc_redist.arm64.exe'
-          $exe = Join-Path $env:RUNNER_TEMP 'vc_redist.arm64.exe'
-          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-          # Pass 1: 7z reads the WiX Burn bundle and emits the inner payload
-          # files under opaque names (`0`, `u0`, `u1`, …) — Burn stores
-          # package payloads by payload-id, not by filename, and 7z exposes
-          # them as-is on this host.
-          $burn = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-burn'
-          & $sevenZip x "-o$burn" -y $exe | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "7z expand of vc_redist.arm64.exe failed: $LASTEXITCODE" }
-          # Pass 2: detect the MSI payloads by their OLE Compound Document
-          # signature (D0 CF 11 E0 A1 B1 1A E1) and administratively install
-          # each to extract its CABs' payload files. `msiexec /a` runs on any
-          # Windows host, cross-arch, and never executes install actions —
-          # it just lays the files out under TARGETDIR, which is exactly
-          # what we need to get the arm64 vcruntime140.dll on an x64 build host.
-          $msiOut = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-msi'
-          New-Item -ItemType Directory -Force $msiOut | Out-Null
-          $msiSig = [byte[]]@(0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1)
-          $msiCount = 0
-          foreach ($file in Get-ChildItem -File $burn) {
-            if ($file.Length -lt 8) { continue }
-            $head = New-Object byte[] 8
-            $fs = [System.IO.File]::OpenRead($file.FullName)
-            try { [void]$fs.Read($head, 0, 8) } finally { $fs.Dispose() }
-            $isMsi = $true
-            for ($i = 0; $i -lt 8; $i++) { if ($head[$i] -ne $msiSig[$i]) { $isMsi = $false; break } }
-            if (-not $isMsi) { continue }
-            $msiCount++
-            # msiexec requires a .msi extension on the input path.
-            $msiCopy = Join-Path $env:RUNNER_TEMP "payload-$($file.Name).msi"
-            Copy-Item $file.FullName $msiCopy -Force
-            $target = Join-Path $msiOut $file.Name
-            New-Item -ItemType Directory -Force $target | Out-Null
-            $proc = Start-Process -FilePath 'msiexec' -Wait -PassThru -NoNewWindow `
-              -ArgumentList @('/a', $msiCopy, '/qn', "TARGETDIR=$target")
-            if ($proc.ExitCode -ne 0) {
-              Write-Host "msiexec /a on $($file.Name) exited $($proc.ExitCode); continuing"
-            }
-          }
-          Write-Host "Processed $msiCount MSI payload(s) from the Burn bundle"
-          $dll = Get-ChildItem -Recurse $msiOut -Filter 'vcruntime140.dll' |
-            Where-Object { $_.Length -gt 10000 } |
-            Select-Object -First 1
-          if (-not $dll) {
-            Write-Host '--- Burn bundle contents ---'
-            Get-ChildItem -Recurse $burn | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
-            Write-Host '--- MSI contents ---'
-            Get-ChildItem -Recurse $msiOut | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
-            throw 'vcruntime140.dll not found after extracting vc_redist.arm64.exe'
-          }
-          Write-Host "Extracted ARM64 vcruntime140.dll to $($dll.FullName) ($($dll.Length) bytes)"
-          # OPENHUMAN_VC_REDIST_DIR expects a directory containing the DLL by
-          # its unqualified name — point at the dll's own parent dir.
-          "OPENHUMAN_VC_REDIST_DIR=$($dll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Download and verify every bundled release
         run: node scripts/release/stage-modules.mjs --target ${{ matrix.target }}
