@@ -110,9 +110,9 @@ function* walkStaged(root) {
   }
 }
 
-export function verifyBundledModules({ dir = DEFAULT_DIR } = {}) {
-  const source = readRegistrySource();
-  const expected = pinsIndex(source);
+export function verifyBundledModules({ dir = DEFAULT_DIR, source } = {}) {
+  const registrySource = source ?? readRegistrySource();
+  const expected = pinsIndex(registrySource);
 
   const problems = [];
   let checked = 0;
