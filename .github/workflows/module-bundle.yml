@@ -37,32 +37,38 @@ jobs:
           node-version: 24.x
       - name: Check registry coverage
         run: node --test scripts/__tests__/stage-modules.test.mjs
-      # The windows-latest runner image installs the x64 VC++ redistributable
-      # by default but not the ARM64 one, and stage-modules now ships
+      # The windows-latest runner image ships Visual Studio with the x64 build
+      # tools and their redist, but NOT the ARM64 ones. stage-modules now ships
       # vcruntime140.dll beside each Windows module to close issue #8499 /
-      # Sentry TAURI-RUST-14J5. Extract vcruntime140.dll for arm64 from
-      # Microsoft's official VC redistributable using the installer's /layout
-      # mode (cross-arch, no admin install), then point stage-modules at the
-      # extracted directory via OPENHUMAN_VC_REDIST_DIR. /layout is the
-      # supported way to retrieve a redistributable's payload on any host arch.
-      - name: Prepare ARM64 Visual C++ runtime (app-local staging source)
+      # Sentry TAURI-RUST-14J5, so the ARM64 host_key needs an arm64 CRT on the
+      # build host. The cleanest provisioning path is to add the ARM64 build
+      # tools component to the installed VS via `vs_installer modify`; that
+      # drops the arm64 CRT into VC\Redist\MSVC\<version>\arm64\, where the
+      # existing `findWindowsVcRuntimeDir` + vswhere lookup finds it. Earlier
+      # attempts via `vc_redist.arm64.exe /layout` failed on the x64 runner
+      # (empty exit code; the installer appears to refuse a cross-arch layout
+      # on this host).
+      - name: Install Visual Studio ARM64 build tools (app-local VC runtime source)
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = 'https://aka.ms/vs/17/release/vc_redist.arm64.exe'
-          $exe = Join-Path $env:RUNNER_TEMP 'vc_redist.arm64.exe'
-          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-          $layout = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-layout'
-          & $exe /layout $layout /quiet
-          if ($LASTEXITCODE -ne 0) { throw "vc_redist /layout failed: $LASTEXITCODE" }
-          $msi = Get-ChildItem -Recurse $layout -Filter 'vcRuntimeMinimum_arm64*.msi' | Select-Object -First 1
-          if (-not $msi) { throw 'vcRuntimeMinimum_arm64 MSI not found in layout' }
-          $extracted = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-extracted'
-          $proc = Start-Process -FilePath 'msiexec' -ArgumentList "/a `"$($msi.FullName)`" /qn TARGETDIR=`"$extracted`"" -Wait -NoNewWindow -PassThru
-          if ($proc.ExitCode -ne 0) { throw "msiexec /a failed: $($proc.ExitCode)" }
-          $dll = Get-ChildItem -Recurse $extracted -Filter 'vcruntime140.dll' | Select-Object -First 1
-          if (-not $dll) { throw 'vcruntime140.dll not found after admin install' }
-          "OPENHUMAN_VC_REDIST_DIR=$($dll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+          $installPath = & $vswhere -latest -products '*' -property installationPath
+          if (-not $installPath) { throw 'no Visual Studio installation detected' }
+          Write-Host "Modifying VS installation at $installPath"
+          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          if (-not (Test-Path $vsInstaller)) { throw "vs_installer.exe not found at $vsInstaller" }
+          # Pin exit codes we accept: 0 (success), 862/1641/3010 (install
+          # succeeded but requested a reboot — fine for file-level use).
+          $allowed = @(0, 862, 1641, 3010)
+          & $vsInstaller modify --quiet --norestart --wait `
+            --installPath "$installPath" `
+            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64
+          if ($allowed -notcontains $LASTEXITCODE) {
+            throw "vs_installer modify failed: $LASTEXITCODE"
+          }
+          Write-Host "vs_installer modify finished (exit $LASTEXITCODE); ARM64 CRT should now be under VC\Redist\MSVC\*\arm64\"
       - name: Download and verify every bundled release
         run: node scripts/release/stage-modules.mjs --target ${{ matrix.target }}

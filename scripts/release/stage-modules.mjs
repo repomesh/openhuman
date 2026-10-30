@@ -199,6 +199,28 @@ export function peMachine(path) {
  * directory. On Windows this invokes `Get-AuthenticodeSignature` and refuses
  * anything whose signer subject does not contain `CN=Microsoft`.
  */
+/**
+ * Pick a PowerShell host for Authenticode validation. PowerShell 7 (`pwsh.exe`)
+ * autoloads `Microsoft.PowerShell.Security` reliably, including when launched
+ * from Node's `execFileSync`; Windows PowerShell 5.1 (`powershell.exe`) can
+ * fail with `CouldNotAutoloadMatchingModule` on the hosted windows-latest
+ * runners (observed during Module bundle CI). Prefer `pwsh.exe` where
+ * available; fall back to `powershell.exe` with an explicit `Import-Module`.
+ */
+function resolvePowerShellHost() {
+  for (const candidate of ["pwsh.exe", "powershell.exe"]) {
+    try {
+      execFileSync(candidate, ["-NoProfile", "-Command", "exit 0"], { stdio: "ignore" });
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(
+    "neither pwsh.exe nor powershell.exe is available for Authenticode validation",
+  );
+}
+
 export function assertMicrosoftSigned(path) {
   // Test-only escape: setting OPENHUMAN_SKIP_AUTHENTICODE_CHECK=1 bypasses the
   // signer check so unit tests can use a hand-rolled PE stub. This is NEVER
@@ -219,13 +241,18 @@ export function assertMicrosoftSigned(path) {
     );
     return;
   }
+  const host = resolvePowerShellHost();
+  // Import-Module ensures the Security cmdlets are available on Windows
+  // PowerShell 5.1, which can fail to autoload the module under execFileSync.
+  // On pwsh.exe it's a cheap no-op since autoload would have found it anyway.
   const subject = execFileSync(
-    "powershell.exe",
+    host,
     [
       "-NoProfile",
       "-NonInteractive",
       "-Command",
       "$ErrorActionPreference = 'Stop'; " +
+        "Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue; " +
         "$s = Get-AuthenticodeSignature -LiteralPath $env:OPENHUMAN_AUTHENTICODE_PATH; " +
         "if ($s.Status -ne 'Valid') { throw \"signature status $($s.Status): $($s.StatusMessage)\" }; " +
         "if (-not $s.SignerCertificate) { throw 'no signer certificate' }; " +
