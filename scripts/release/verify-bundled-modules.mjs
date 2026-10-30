@@ -22,9 +22,18 @@
 // it one more time against the final installer artifacts.
 //
 // Usage: node scripts/release/verify-bundled-modules.mjs [--dir DIR]
+//                                                        [--target TRIPLE | --host-key KEY]
 //
-// Exits 0 if every staged file matches its pin; non-zero with a human-readable
-// diff on the first miss.
+// Without `--target`/`--host-key` the gate only checks that every present
+// staged entry matches its pin — it cannot catch an incomplete stage (a tree
+// with one correctly-pinned macOS marker and no Linux archives would pass on
+// a Linux build). Passing the build target (as the matrix step does) turns
+// on the completeness check: every asset the registry expects for that host
+// MUST also be on disk, or the gate reports it as missing.
+//
+// Exits 0 if every staged file matches its pin and (when a target is given)
+// the expected asset set is complete; non-zero with a human-readable diff on
+// the first miss.
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -35,6 +44,7 @@ import { parseAllList, parseRecords } from "../lib/module-pins.mjs";
 import {
   readRegistrySource,
 } from "../ci/self-hosted/test-module-assets.mjs";
+import { bundledAssets, hostKeyForTarget } from "./stage-modules.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_DIR = join(ROOT, "crates/openhuman-app/bundled-modules");
@@ -110,15 +120,35 @@ function* walkStaged(root) {
   }
 }
 
-export function verifyBundledModules({ dir = DEFAULT_DIR, source } = {}) {
+/**
+ * The expected (id, version, hostKey, archive) key set for `hostKey`,
+ * derived the same way `stage-modules.mjs` picks what to download.
+ */
+function expectedKeySet(source, hostKey) {
+  return new Set(
+    bundledAssets(source, hostKey).map(
+      (a) => `${a.id}/${a.version}/${a.hostKey}/${a.archive}`,
+    ),
+  );
+}
+
+export function verifyBundledModules({
+  dir = DEFAULT_DIR,
+  source,
+  hostKey,
+} = {}) {
   const registrySource = source ?? readRegistrySource();
   const expected = pinsIndex(registrySource);
+  const mustStage = hostKey
+    ? expectedKeySet(registrySource, hostKey)
+    : null;
 
   const problems = [];
   let checked = 0;
   for (const entry of walkStaged(dir)) {
     checked += 1;
     const key = `${entry.id}/${entry.version}/${entry.hostKey}/${entry.archive}`;
+    if (mustStage) mustStage.delete(key);
     const pin = expected.get(key);
     if (!pin) {
       problems.push({
@@ -145,6 +175,19 @@ export function verifyBundledModules({ dir = DEFAULT_DIR, source } = {}) {
     }
   }
 
+  if (mustStage) {
+    for (const key of mustStage) {
+      problems.push({
+        kind: "missing",
+        key,
+        hostKey,
+        message:
+          `staged tree is missing an asset the registry requires for ${hostKey}: ${key}. ` +
+          `A partial stage ships an installer whose host-side module set is incomplete.`,
+      });
+    }
+  }
+
   if (checked === 0) {
     throw new Error(
       `no archives or markers under ${dir}; was \`stage-modules.mjs\` run?`,
@@ -156,12 +199,15 @@ export function verifyBundledModules({ dir = DEFAULT_DIR, source } = {}) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const dir = option("--dir") ? resolve(option("--dir")) : DEFAULT_DIR;
-  const { checked, problems } = verifyBundledModules({ dir });
+  const target = option("--target");
+  const hostKey = option("--host-key") ?? (target ? hostKeyForTarget(target) : undefined);
+  const { checked, problems } = verifyBundledModules({ dir, hostKey });
   if (problems.length === 0) {
-    console.log(`[verify-bundled-modules] ok: ${checked} entries match their registry pins`);
+    const scope = hostKey ? ` for ${hostKey}` : "";
+    console.log(`[verify-bundled-modules] ok: ${checked} entries match their registry pins${scope}`);
     process.exit(0);
   }
-  console.error(`[verify-bundled-modules] FAIL: ${problems.length}/${checked} entries disagree with the registry:`);
+  console.error(`[verify-bundled-modules] FAIL: ${problems.length} problem(s) across ${checked} entries:`);
   for (const p of problems) console.error(`  - ${p.message}`);
   process.exit(1);
 }

@@ -184,6 +184,44 @@ test("macOS marker: content drifts from the pin → mismatch", () => {
   assert.equal(problems[0].actual, stale);
 });
 
+test("target completeness: a staged tree missing an expected host asset reports it", () => {
+  const dir = makeDir();
+  const linuxBytes = Buffer.from("linux ok");
+  const linuxSha = sha256Hex(linuxBytes);
+  const source = makeSource({
+    linuxSha,
+    macSha: "b".repeat(64), // the mac asset the registry expects, left unstaged
+  });
+  // Stage only the Linux archive. The macOS asset is in the pins for this
+  // host-level build matrix cell, but absent from disk — a partial stage.
+  writeArchive(dir, {
+    id: "tinymock",
+    version: "0.1.0",
+    hostKey: "ubuntu-22.04-x86_64",
+    archive: "tinymock-0.1.0-ubuntu-22.04-x86_64.tar.gz",
+    bytes: linuxBytes,
+  });
+
+  // Without a hostKey: the Linux archive passes and the macOS gap is invisible.
+  const open = verifyBundledModules({ dir, source });
+  assert.equal(open.checked, 1);
+  assert.deepEqual(open.problems, []);
+
+  // With hostKey="macos-15-arm64": the completeness check fires. The staged
+  // Linux archive is still inspected (and found correct) but it does not
+  // belong to this host, so it is also flagged as unknown-for-this-host.
+  const strict = verifyBundledModules({
+    dir,
+    source,
+    hostKey: "macos-15-arm64",
+  });
+  const missing = strict.problems.find((p) => p.kind === "missing");
+  assert.ok(missing, "expected a missing-asset problem");
+  assert.equal(missing.hostKey, "macos-15-arm64");
+  assert.match(missing.key, /^tinymock\/0\.1\.0\/macos-15-arm64\//);
+  assert.match(missing.message, /partial stage/);
+});
+
 test("empty tree: throws explaining stage-modules.mjs was not run", () => {
   const dir = makeDir();
   const source = makeSource({

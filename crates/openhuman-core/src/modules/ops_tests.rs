@@ -96,26 +96,26 @@ fn test_bundled_record_with_mismatched_pin() -> &'static crate::modules::types::
     }))
 }
 
-/// Regression for TAURI-RUST-11MZ / issue #8500.
+/// Regression for TAURI-RUST-11MZ / issue #8500 — the digest-rejection
+/// branch, as seen from the host.
 ///
-/// On production 0.64.15 Linux installs the tinybus module loader emitted
+/// The sibling test above runs the "pin matches on disk, extract fails"
+/// path. This one runs the distinct "pin mismatches on disk" path: an
+/// installer-bundle archive is present but its bytes do not hash to the
+/// compiled-in pin, so tinybus's loader refuses it. Downloads are hard-
+/// disabled in the installer-bundle branch, so the admission path has
+/// nowhere else to fall through to.
 ///
-///   module 'tinyconnectors' could not be loaded from the installer bundle:
-///   module `github-release` refused: release is not cached and downloads
-///   are disabled. Restart the app after repairing the installation
+/// Per AGENTS.md ("Module behavior is tested in the owning `vendor/tiny*`
+/// repository"), the exact wording of the digest-rejection error is
+/// tinybus's to pin; this test covers only the host-level contract:
 ///
-/// because a bundled archive was present on disk but its sha256 did not
-/// match the pin compiled into `records_mcp_connectors.rs`. Downloads are
-/// hard-disabled in the installer-bundle branch, so verification refuses the
-/// bytes and the admission path has nowhere else to fall through to.
-///
-/// This test pins all four load-bearing phrases of that message. The build-
-/// time fix is `scripts/release/verify-bundled-modules.mjs`, which makes a
-/// pin-drifted installer impossible to seal. This test guards the runtime
-/// path: if a mismatched bundle ever ships again, the user-facing error
-/// stays exactly as above and does not silently mutate under refactors.
+/// * the error is surfaced to the caller scoped as an installer-bundle
+///   failure (so Sentry groups it with the user-facing message);
+/// * the user cache is not populated — a refused bundled archive must
+///   never silently fall back to the download path.
 #[tokio::test]
-async fn issue_8500_installer_bundle_sha_mismatch_reports_the_exact_sentry_error() {
+async fn installer_bundle_sha_mismatch_is_reported_and_does_not_populate_the_cache() {
     let record = test_bundled_record_with_mismatched_pin();
     let bundled = tempfile::tempdir().unwrap();
     let user_cache = tempfile::tempdir().unwrap();
@@ -145,18 +145,13 @@ async fn issue_8500_installer_bundle_sha_mismatch_reports_the_exact_sentry_error
     )
     .unwrap_err();
 
-    // Load-bearing phrases from TAURI-RUST-11MZ. All four must stay stable.
-    for phrase in [
-        "could not be loaded from the installer bundle",
-        "github-release",
-        "release is not cached and downloads are disabled",
-        "repairing the installation",
-    ] {
-        assert!(
-            error.contains(phrase),
-            "missing phrase {phrase:?} in error: {error}"
-        );
-    }
+    // Host-level scope marker: the error must identify this as an
+    // installer-bundle failure (not a generic download-disabled miss)
+    // so the Sentry rule that files TAURI-RUST-11MZ keeps grouping it.
+    assert!(error.contains("installer bundle"), "{error}");
+    // The load-bearing host invariant: a refused bundled archive must
+    // not touch the download cache. If this ever regresses, a pin-
+    // drifted installer silently falls back to the network path.
     assert!(
         !user_cache.path().join(record.id).exists(),
         "a refused bundled archive must not touch the download cache"
