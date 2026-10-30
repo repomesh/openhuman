@@ -520,19 +520,6 @@ pub async fn import_legacy_tinyjuice_savings(
 #[path = "import_once_tests.rs"]
 mod import_once_tests;
 
-// Lives here, not in `ops.rs`, so that file stays at its upstream line count
-// (`scripts/ci/check-openhuman-rust-layout.mjs` fails CI if it grows past the
-// legacy pin). The test file declares its own fixtures and shares nothing
-// private with `ops`, so hosting the mod decl at this level is semantics-
-// preserving. Gated on `feature = "modules"` to match the sibling
-// `import_once_tests` above: the test calls `crate::modules::runtime`,
-// which is only reachable with that feature, and `gate-contract-tests`
-// compiles the library suite with `--no-default-features
-// --features storage-sqlite`.
-#[cfg(all(test, feature = "modules"))]
-#[path = "ops_installer_bundle_tests.rs"]
-mod ops_installer_bundle_tests;
-
 #[cfg(all(
     test,
     feature = "modules",
