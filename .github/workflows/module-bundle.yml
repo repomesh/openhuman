@@ -67,14 +67,34 @@ jobs:
           # operator can return before it finishes, so $LASTEXITCODE would be
           # read before the ARM64 CRT is actually on disk. Start-Process
           # -Wait -PassThru blocks until the process exits and gives us the
-          # real exit code to gate on.
-          $proc = Start-Process -FilePath $vsInstaller -Wait -PassThru -NoNewWindow -ArgumentList @(
-            'modify',
-            '--quiet', '--norestart', '--wait',
-            '--installPath', $installPath,
-            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
-          )
+          # real exit code to gate on. `--wait` is omitted from vs_installer's
+          # own args — in modify mode on VS 2026 it can trigger exit 87
+          # (ERROR_INVALID_PARAMETER), and Start-Process -Wait already
+          # provides the semantics we need.
+          $stdoutLog = Join-Path $env:RUNNER_TEMP 'vs_installer.stdout.log'
+          $stderrLog = Join-Path $env:RUNNER_TEMP 'vs_installer.stderr.log'
+          $proc = Start-Process -FilePath $vsInstaller -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog `
+            -ArgumentList @(
+              'modify',
+              '--quiet', '--norestart',
+              '--installPath', $installPath,
+              '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+            )
           if ($allowed -notcontains $proc.ExitCode) {
+            Write-Host '--- vs_installer stdout ---'
+            if (Test-Path $stdoutLog) { Get-Content $stdoutLog | Write-Host }
+            Write-Host '--- vs_installer stderr ---'
+            if (Test-Path $stderrLog) { Get-Content $stderrLog | Write-Host }
+            # vs_installer writes dated log files to %TEMP%\dd_installer_*.log.
+            # Surface the most recent one so the real failure reason reaches
+            # the CI log instead of only the exit code.
+            $log = Get-ChildItem -Path $env:TEMP -Filter 'dd_installer_*.log' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($log) {
+              Write-Host "--- $($log.FullName) (tail) ---"
+              Get-Content $log.FullName -Tail 100 | Write-Host
+            }
             throw "vs_installer modify failed: $($proc.ExitCode)"
           }
           Write-Host "vs_installer modify finished (exit $($proc.ExitCode)); ARM64 CRT should now be under VC\Redist\MSVC\*\arm64\"

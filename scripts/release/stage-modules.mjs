@@ -264,14 +264,22 @@ export function assertMicrosoftSigned(path) {
       encoding: "utf8",
     },
   ).trim();
-  // Match the WHOLE CN attribute. `/CN=Microsoft/i` is an unanchored
-  // substring — a subject like `CN=MicrosoftEvil` or `CN=Microsoft Foo Ltd`
-  // would slip through. The X.500 subject puts attributes between commas, so
-  // anchor on comma-or-start and comma-or-end. Microsoft's code-signing
-  // subject is consistently `CN=Microsoft Corporation`.
-  if (!/(?:^|,\s*)CN=Microsoft Corporation(?:,|$)/.test(subject)) {
+  // Match on the Organization attribute, anchored to the whole X.500 field.
+  // The CN varies across Microsoft code-signing certificates — the VC redist's
+  // vcruntime140.dll ships with
+  //   `CN=Microsoft Windows Software Compatibility Publisher, O=Microsoft
+  //    Corporation, L=Redmond, S=Washington, C=US`
+  // (observed in CI), and other MS-signed artifacts use CNs like
+  // `Microsoft Corporation` or `Microsoft Windows`. The Organization attribute
+  // (`O=Microsoft Corporation`) is the stable discriminator across all MS
+  // code-signing identities. Anchoring on comma-or-start and comma-or-end
+  // prevents a `O=MicrosoftEvil` or `O=Microsoft Corporation Clone Ltd` from
+  // passing. An unanchored CN substring on an attribute whose value we don't
+  // control was CodeRabbit's correct concern; applying it to CN was the wrong
+  // attribute.
+  if (!/(?:^|,\s*)O=Microsoft Corporation(?:,|$)/.test(subject)) {
     throw new Error(
-      `${path}: Authenticode signer is not "CN=Microsoft Corporation" (${subject}); refusing to ship into bundled-modules.`,
+      `${path}: Authenticode subject does not include "O=Microsoft Corporation" (${subject}); refusing to ship into bundled-modules.`,
     );
   }
 }
