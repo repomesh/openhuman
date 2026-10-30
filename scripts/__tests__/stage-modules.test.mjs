@@ -24,12 +24,15 @@ import {
   bundledAssets,
   defaultHostKey,
   download,
+  findWindowsVcRuntimeDir,
   hostKeyForTarget,
   extractWindowsZip,
+  isWindowsHostKey,
   keepsArchive,
   normalizeStagedPermissions,
   replaceArchiveWithMarker,
   stageModules,
+  stageWindowsAppLocalRuntime,
 } from "../release/stage-modules.mjs";
 
 const HOST_KEYS = [
@@ -292,4 +295,186 @@ test("normalising staged permissions never follows a symlink out of the tree", {
 
   assert.equal(lstatSync(outside).mode & 0o7777, 0o600);
   assert.equal(lstatSync(staged).mode & 0o7777, 0o755);
+});
+
+// Windows app-local VC runtime staging — issue #8499 / Sentry TAURI-RUST-14J5.
+//
+// `isWindowsHostKey`, `findWindowsVcRuntimeDir`, and `stageWindowsAppLocalRuntime`
+// close the "fresh Windows 10/11 without VC redist installed" load failure for
+// every tiny* native module by shipping vcruntime140.dll beside the module
+// library. The tinybus loader uses LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+// LOAD_LIBRARY_SEARCH_SYSTEM32, which never searches PATH or sibling cache
+// dirs, so an app-local copy is the only reliable resolution path.
+test("isWindowsHostKey picks exactly the windows-* host keys", () => {
+  assert.equal(isWindowsHostKey("windows-2022-x86_64"), true);
+  assert.equal(isWindowsHostKey("windows-11-arm64"), true);
+  assert.equal(isWindowsHostKey("windows-2025-x86_64"), true);
+  assert.equal(isWindowsHostKey("ubuntu-22.04-x86_64"), false);
+  assert.equal(isWindowsHostKey("macos-15-arm64"), false);
+  assert.equal(isWindowsHostKey("fedora-43-x86_64"), false);
+});
+
+test("findWindowsVcRuntimeDir reads OPENHUMAN_VC_REDIST_DIR when it has the DLL", () => {
+  const dir = mkdtempSync(join(tmpdir(), "openhuman-vcrt-override-"));
+  writeFileSync(join(dir, "vcruntime140.dll"), "stub vc runtime bytes");
+  const previous = process.env.OPENHUMAN_VC_REDIST_DIR;
+  process.env.OPENHUMAN_VC_REDIST_DIR = dir;
+  try {
+    assert.equal(findWindowsVcRuntimeDir("windows-2022-x86_64"), dir);
+    assert.equal(findWindowsVcRuntimeDir("windows-11-arm64"), dir);
+  } finally {
+    if (previous === undefined) delete process.env.OPENHUMAN_VC_REDIST_DIR;
+    else process.env.OPENHUMAN_VC_REDIST_DIR = previous;
+  }
+});
+
+test("findWindowsVcRuntimeDir refuses an OPENHUMAN_VC_REDIST_DIR without vcruntime140.dll", () => {
+  const dir = mkdtempSync(join(tmpdir(), "openhuman-vcrt-empty-"));
+  const previous = process.env.OPENHUMAN_VC_REDIST_DIR;
+  process.env.OPENHUMAN_VC_REDIST_DIR = dir;
+  try {
+    assert.throws(
+      () => findWindowsVcRuntimeDir("windows-2022-x86_64"),
+      /does not contain vcruntime140\.dll/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.OPENHUMAN_VC_REDIST_DIR;
+    else process.env.OPENHUMAN_VC_REDIST_DIR = previous;
+  }
+});
+
+test("findWindowsVcRuntimeDir refuses a non-Windows host_key as a programming error", () => {
+  assert.throws(
+    () => findWindowsVcRuntimeDir("ubuntu-22.04-x86_64"),
+    /non-Windows host_key/,
+  );
+});
+
+test("findWindowsVcRuntimeDir fails actionably when no source is available on a non-Windows build host", {
+  skip: process.platform === "win32",
+}, () => {
+  const previous = process.env.OPENHUMAN_VC_REDIST_DIR;
+  const previousTools = process.env.VCToolsRedistDir;
+  delete process.env.OPENHUMAN_VC_REDIST_DIR;
+  delete process.env.VCToolsRedistDir;
+  try {
+    assert.throws(
+      () => findWindowsVcRuntimeDir("windows-2022-x86_64"),
+      /OPENHUMAN_VC_REDIST_DIR/,
+    );
+  } finally {
+    if (previous !== undefined) process.env.OPENHUMAN_VC_REDIST_DIR = previous;
+    if (previousTools !== undefined) process.env.VCToolsRedistDir = previousTools;
+  }
+});
+
+test("stageWindowsAppLocalRuntime is a no-op on non-Windows host keys", () => {
+  const target = mkdtempSync(join(tmpdir(), "openhuman-vcrt-noop-"));
+  const copied = stageWindowsAppLocalRuntime(target, "ubuntu-22.04-x86_64");
+  assert.deepEqual(copied, []);
+  assert.deepEqual(readdirSync(target), []);
+});
+
+test("stageWindowsAppLocalRuntime copies the Windows runtime next to the module", () => {
+  const source = mkdtempSync(join(tmpdir(), "openhuman-vcrt-src-"));
+  writeFileSync(join(source, "vcruntime140.dll"), "stub vc runtime bytes");
+  const target = mkdtempSync(join(tmpdir(), "openhuman-vcrt-target-"));
+  writeFileSync(join(target, "tinyconnectors.dll"), "stub module bytes");
+
+  const previous = process.env.OPENHUMAN_VC_REDIST_DIR;
+  process.env.OPENHUMAN_VC_REDIST_DIR = source;
+  try {
+    const copied = stageWindowsAppLocalRuntime(target, "windows-2022-x86_64");
+    assert.deepEqual(copied, [join(target, "vcruntime140.dll")]);
+    assert.equal(
+      readFileSync(join(target, "vcruntime140.dll"), "utf8"),
+      "stub vc runtime bytes",
+    );
+    // The module library it was staged beside is untouched.
+    assert.equal(
+      readFileSync(join(target, "tinyconnectors.dll"), "utf8"),
+      "stub module bytes",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.OPENHUMAN_VC_REDIST_DIR;
+    else process.env.OPENHUMAN_VC_REDIST_DIR = previous;
+  }
+});
+
+// stageModules asserts exactly one native library per archive. The staged VC
+// runtime files are also `.dll`s; they must not count toward that invariant or
+// every Windows module would fail the check.
+test("stageModules on windows-2022-x86_64 ships vcruntime140.dll beside the module", async () => {
+  const hostKey = "windows-2022-x86_64";
+  const root = mkdtempSync(join(tmpdir(), "openhuman-stage-windows-"));
+  const library = "demo.dll";
+  const archiveName = `demo-1.0.0-${hostKey}.zip`;
+  const built = join(root, archiveName);
+
+  // Minimal valid ZIP containing one entry named `demo.dll` with the bytes
+  // "library bytes" (uncompressed). Hand-rolled so this test does not require
+  // a `zip` binary on the test runner.
+  const entryName = Buffer.from(library);
+  const payload = Buffer.from("library bytes");
+  const localHeader = Buffer.alloc(30);
+  localHeader.writeUInt32LE(0x04034b50, 0);
+  localHeader.writeUInt16LE(20, 4);
+  localHeader.writeUInt16LE(0, 6);
+  localHeader.writeUInt16LE(0, 8);
+  localHeader.writeUInt32LE(payload.length, 18);
+  localHeader.writeUInt32LE(payload.length, 22);
+  localHeader.writeUInt16LE(entryName.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(payload.length, 20);
+  central.writeUInt32LE(payload.length, 24);
+  central.writeUInt16LE(entryName.length, 28);
+  const localSize = localHeader.length + entryName.length + payload.length;
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length + entryName.length, 12);
+  end.writeUInt32LE(localSize, 16);
+  const archiveBytes = Buffer.concat([
+    localHeader,
+    entryName,
+    payload,
+    central,
+    entryName,
+    end,
+  ]);
+  writeFileSync(built, archiveBytes);
+  const sha256 = createHash("sha256").update(archiveBytes).digest("hex");
+  const output = join(root, "out");
+
+  const redist = mkdtempSync(join(tmpdir(), "openhuman-vcrt-source-"));
+  writeFileSync(join(redist, "vcruntime140.dll"), "stub vc runtime bytes");
+
+  const previous = process.env.OPENHUMAN_VC_REDIST_DIR;
+  process.env.OPENHUMAN_VC_REDIST_DIR = redist;
+  try {
+    await withServer((req, res) => res.end(archiveBytes), async (url) => {
+      await stageModules({
+        hostKey,
+        output,
+        assets: [{ id: "demo", version: "1.0.0", hostKey, archive: archiveName, url, sha256 }],
+      });
+    });
+  } finally {
+    if (previous === undefined) delete process.env.OPENHUMAN_VC_REDIST_DIR;
+    else process.env.OPENHUMAN_VC_REDIST_DIR = previous;
+  }
+
+  const dir = join(output, "demo", "1.0.0", hostKey);
+  // Module library, archive, and VC runtime all land in the host_key dir.
+  assert.ok(existsSync(join(dir, library)), "the module library was staged");
+  assert.ok(existsSync(join(dir, archiveName)), "the archive is kept on Windows");
+  assert.equal(
+    readFileSync(join(dir, "vcruntime140.dll"), "utf8"),
+    "stub vc runtime bytes",
+    "vcruntime140.dll is staged beside the module",
+  );
 });

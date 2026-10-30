@@ -37,5 +37,32 @@ jobs:
           node-version: 24.x
       - name: Check registry coverage
         run: node --test scripts/__tests__/stage-modules.test.mjs
+      # The windows-latest runner image installs the x64 VC++ redistributable
+      # by default but not the ARM64 one, and stage-modules now ships
+      # vcruntime140.dll beside each Windows module to close issue #8499 /
+      # Sentry TAURI-RUST-14J5. Extract vcruntime140.dll for arm64 from
+      # Microsoft's official VC redistributable using the installer's /layout
+      # mode (cross-arch, no admin install), then point stage-modules at the
+      # extracted directory via OPENHUMAN_VC_REDIST_DIR. /layout is the
+      # supported way to retrieve a redistributable's payload on any host arch.
+      - name: Prepare ARM64 Visual C++ runtime (app-local staging source)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://aka.ms/vs/17/release/vc_redist.arm64.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'vc_redist.arm64.exe'
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $layout = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-layout'
+          & $exe /layout $layout /quiet
+          if ($LASTEXITCODE -ne 0) { throw "vc_redist /layout failed: $LASTEXITCODE" }
+          $msi = Get-ChildItem -Recurse $layout -Filter 'vcRuntimeMinimum_arm64*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'vcRuntimeMinimum_arm64 MSI not found in layout' }
+          $extracted = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-extracted'
+          $proc = Start-Process -FilePath 'msiexec' -ArgumentList "/a `"$($msi.FullName)`" /qn TARGETDIR=`"$extracted`"" -Wait -NoNewWindow -PassThru
+          if ($proc.ExitCode -ne 0) { throw "msiexec /a failed: $($proc.ExitCode)" }
+          $dll = Get-ChildItem -Recurse $extracted -Filter 'vcruntime140.dll' | Select-Object -First 1
+          if (-not $dll) { throw 'vcruntime140.dll not found after admin install' }
+          "OPENHUMAN_VC_REDIST_DIR=$($dll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Download and verify every bundled release
         run: node scripts/release/stage-modules.mjs --target ${{ matrix.target }}

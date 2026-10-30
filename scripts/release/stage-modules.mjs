@@ -225,17 +225,35 @@ export function findWindowsVcRuntimeDir(hostKey) {
       `${redistRoot} missing; install the "MSVC v143 - VS 2022 C++ x64/x86 build tools" workload or set OPENHUMAN_VC_REDIST_DIR.`,
     );
   }
-  // Newest redist version wins; VC143 is the current ABI shipped since VS 2022.
+  // Walk every <version>/<arch>/<any>/ dir under VC/Redist/MSVC and admit the
+  // first one that holds our runtime files. The fast path matches VC143 by
+  // name; the fallback accepts any Microsoft.VC14*.CRT (VS 2026 ships VC144+
+  // under the same layout) and tolerates vendor-specific suffixes like
+  // "Microsoft.VC143.CRT.Spectre" that the Spectre-mitigated redist workloads
+  // install alongside the plain one. Newest redist version wins.
   const versions = readdirSync(redistRoot, { withFileTypes: true })
     .filter((e) => e.isDirectory())
     .map((e) => e.name)
     .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
   for (const version of versions) {
-    const crtDir = join(redistRoot, version, arch, "Microsoft.VC143.CRT");
-    if (existsSync(join(crtDir, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return crtDir;
+    const archDir = join(redistRoot, version, arch);
+    if (!existsSync(archDir)) continue;
+    const fastPath = join(archDir, "Microsoft.VC143.CRT");
+    if (existsSync(join(fastPath, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return fastPath;
+    for (const entry of readdirSync(archDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      // Prefer non-Spectre CRT subdirs so we never ship Spectre-mitigated bits
+      // to users who did not opt into them (the plain CRT is MS-signed and
+      // ABI-identical for app-local deployment).
+      if (!/^Microsoft\.VC14[0-9]+\.CRT$/.test(entry.name)) continue;
+      const candidate = join(archDir, entry.name);
+      if (existsSync(join(candidate, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return candidate;
+    }
   }
   throw new Error(
-    `no Microsoft.VC143.CRT/${WINDOWS_APP_LOCAL_RUNTIME_FILES[0]} under ${redistRoot}`,
+    `no Microsoft.VC14*.CRT/${WINDOWS_APP_LOCAL_RUNTIME_FILES[0]} for ${arch} under ${redistRoot}. ` +
+      `Install the "MSVC v14x - ${arch === "arm64" ? "ARM64/ARM64EC" : "x64/x86"} build tools" ` +
+      `workload via vs_installer, or set OPENHUMAN_VC_REDIST_DIR to a directory containing the file.`,
   );
 }
 
