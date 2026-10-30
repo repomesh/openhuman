@@ -44,7 +44,11 @@ import { parseAllList, parseRecords } from "../lib/module-pins.mjs";
 import {
   readRegistrySource,
 } from "../ci/self-hosted/test-module-assets.mjs";
-import { bundledAssets, hostKeyForTarget } from "./stage-modules.mjs";
+import {
+  bundledAssets,
+  hostKeyForTarget,
+  keepsArchive,
+} from "./stage-modules.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_DIR = join(ROOT, "crates/openhuman-app/bundled-modules");
@@ -148,7 +152,6 @@ export function verifyBundledModules({
   for (const entry of walkStaged(dir)) {
     checked += 1;
     const key = `${entry.id}/${entry.version}/${entry.hostKey}/${entry.archive}`;
-    if (mustStage) mustStage.delete(key);
     const pin = expected.get(key);
     if (!pin) {
       problems.push({
@@ -159,6 +162,26 @@ export function verifyBundledModules({
       });
       continue;
     }
+    // `walkStaged` strips `.sha256` from a marker so an archive and a marker
+    // on the same hostKey produce the same `key` — a stray marker on a Linux
+    // or Windows host would otherwise satisfy both the pin lookup and the
+    // completeness check for an asset that stage-modules.mjs requires to be
+    // a real archive. `keepsArchive(hostKey)` is the single source of truth
+    // for which host carries which kind on disk; run the type check here
+    // before anything can accept the entry (and before completeness clears
+    // the key from `mustStage`).
+    const expectedKind = keepsArchive(entry.hostKey) ? "archive" : "marker";
+    if (entry.kind !== expectedKind) {
+      problems.push({
+        kind: "wrong-type",
+        entry,
+        message:
+          `staged ${entry.kind} is not the required ${expectedKind} for ${entry.hostKey}: ${key} ` +
+          `(stage-modules.mjs produces archives on hosts where keepsArchive(hostKey) is true, markers otherwise)`,
+      });
+      continue;
+    }
+    if (mustStage) mustStage.delete(key);
     const actual =
       entry.kind === "archive" ? sha256OfFile(entry.path) : readMarker(entry.path).toLowerCase();
     if (actual !== pin) {

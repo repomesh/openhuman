@@ -184,6 +184,43 @@ test("macOS marker: content drifts from the pin → mismatch", () => {
   assert.equal(problems[0].actual, stale);
 });
 
+test("wrong-type: a sha256 marker on a Linux host does not satisfy its archive pin", () => {
+  // walkStaged strips `.sha256` from a marker, so an archive and a marker on
+  // the same hostKey produce an identical key. Before the type gate, a
+  // marker whose content equals the archive pin would pass pin verification
+  // AND clear the completeness check on a Linux build. Guard against that.
+  const dir = makeDir();
+  const linuxArchiveSha = "a".repeat(64);
+  const source = makeSource({
+    linuxSha: linuxArchiveSha,
+    macSha: "0".repeat(64),
+  });
+  writeMarker(dir, {
+    id: "tinymock",
+    version: "0.1.0",
+    hostKey: "ubuntu-22.04-x86_64",
+    archive: "tinymock-0.1.0-ubuntu-22.04-x86_64.tar.gz",
+    // Marker content equals the archive pin — pre-fix this passed.
+    content: `${linuxArchiveSha}\n`,
+  });
+
+  const { checked, problems } = verifyBundledModules({
+    dir,
+    source,
+    hostKey: "ubuntu-22.04-x86_64",
+  });
+
+  assert.equal(checked, 1);
+  // Two problems: wrong-type on the marker, and missing for the archive the
+  // staged marker's key was NOT allowed to clear from the completeness set.
+  const wrongType = problems.find((p) => p.kind === "wrong-type");
+  const missing = problems.find((p) => p.kind === "missing");
+  assert.ok(wrongType, "expected wrong-type problem");
+  assert.equal(wrongType.entry.kind, "marker");
+  assert.match(wrongType.message, /required archive/);
+  assert.ok(missing, "wrong-type must not clear the archive from mustStage");
+});
+
 test("target completeness: a staged tree missing an expected host asset reports it", () => {
   const dir = makeDir();
   const linuxBytes = Buffer.from("linux ok");
