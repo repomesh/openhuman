@@ -54,6 +54,115 @@ fn test_bundled_record() -> &'static crate::modules::types::ModuleRecord {
         },
     }))
 }
+/// Variant of `test_bundled_record` whose asset sha256 pin is a dummy value
+/// no real archive will ever hash to. Used to reproduce the exact production
+/// condition behind TAURI-RUST-11MZ / issue #8500: a bundled archive whose
+/// bytes do not match the compiled-in registry pin (pin drift between a
+/// staged bundle and the binary that reads it). `test_bundled_record` pins
+/// the empty-input digest and runs the "pin matches, extract fails" path;
+/// this one runs the "pin mismatches on disk" path, which is a distinct
+/// branch of the admission flow.
+fn test_bundled_record_with_mismatched_pin() -> &'static crate::modules::types::ModuleRecord {
+    use crate::modules::types::{LoadPolicy, ModuleRecord, PlatformAsset};
+
+    let host_key = Box::leak(
+        tinybus::module::platform::host_candidates()[0]
+            .clone()
+            .into_boxed_str(),
+    );
+    let assets = Box::leak(Box::new([PlatformAsset {
+        host_key,
+        archive: "test-bundled-module.zip",
+        // Deliberately bogus pin: no real archive will ever hash to this.
+        sha256: "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface",
+        library_sha256: None,
+    }]));
+    Box::leak(Box::new(ModuleRecord {
+        id: "test-bundled-module",
+        description: "test module",
+        bus_name: "test.BundledModule",
+        object_path: "/test/BundledModule",
+        version: "0.0.0",
+        release_url: "https://github.com/tinyhumansai/tinydocs/releases/tag/v0.1.16",
+        assets,
+        load: LoadPolicy::Lazy,
+        source: crate::modules::types::SourceSpec {
+            submodule: "tinydocs",
+            manifest: "Cargo.toml",
+            package: "test-bundled-module",
+            lib_name: "test_bundled_module",
+            features: &[],
+        },
+    }))
+}
+
+/// Regression for TAURI-RUST-11MZ / issue #8500.
+///
+/// On production 0.64.15 Linux installs the tinybus module loader emitted
+///
+///   module 'tinyconnectors' could not be loaded from the installer bundle:
+///   module `github-release` refused: release is not cached and downloads
+///   are disabled. Restart the app after repairing the installation
+///
+/// because a bundled archive was present on disk but its sha256 did not
+/// match the pin compiled into `records_mcp_connectors.rs`. Downloads are
+/// hard-disabled in the installer-bundle branch, so verification refuses the
+/// bytes and the admission path has nowhere else to fall through to.
+///
+/// This test pins all four load-bearing phrases of that message. The build-
+/// time fix is `scripts/release/verify-bundled-modules.mjs`, which makes a
+/// pin-drifted installer impossible to seal. This test guards the runtime
+/// path: if a mismatched bundle ever ships again, the user-facing error
+/// stays exactly as above and does not silently mutate under refactors.
+#[tokio::test]
+async fn issue_8500_installer_bundle_sha_mismatch_reports_the_exact_sentry_error() {
+    let record = test_bundled_record_with_mismatched_pin();
+    let bundled = tempfile::tempdir().unwrap();
+    let user_cache = tempfile::tempdir().unwrap();
+    let bundle_dir = tinybus::module::artifact_dir(
+        bundled.path(),
+        record.id,
+        record.version,
+        record.assets[0].host_key,
+    )
+    .unwrap();
+    std::fs::create_dir_all(&bundle_dir).unwrap();
+    // Any non-empty bytes that do not hash to the deliberately-bogus pin.
+    std::fs::write(
+        bundle_dir.join(record.assets[0].archive),
+        b"PK\x03\x04not-the-pinned-archive-bytes-at-all",
+    )
+    .unwrap();
+
+    let runtime = crate::modules::runtime::runtime().await.unwrap();
+    let error = Resolver::load_cached(
+        runtime,
+        &record.release(),
+        user_cache.path(),
+        &serde_json::json!({}),
+        false,
+        Some(bundled.path()),
+    )
+    .unwrap_err();
+
+    // Load-bearing phrases from TAURI-RUST-11MZ. All four must stay stable.
+    for phrase in [
+        "could not be loaded from the installer bundle",
+        "github-release",
+        "release is not cached and downloads are disabled",
+        "repairing the installation",
+    ] {
+        assert!(
+            error.contains(phrase),
+            "missing phrase {phrase:?} in error: {error}"
+        );
+    }
+    assert!(
+        !user_cache.path().join(record.id).exists(),
+        "a refused bundled archive must not touch the download cache"
+    );
+}
+
 /// The record pins the empty-input digest, so the staged empty archive passes
 /// the digest check and fails to unpack. Digest rejection itself is tinybus's
 /// to test; this pins only that the host reports it and never falls back to

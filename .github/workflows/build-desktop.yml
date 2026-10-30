@@ -379,6 +379,18 @@ jobs:
         shell: bash
         run: node scripts/release/stage-modules.mjs --target "${{ matrix.settings.target }}"
 
+      # Second line of defence against TAURI-RUST-11MZ / issue #8500: re-hash
+      # every staged archive against the sha256 compiled into
+      # crates/openhuman-core/src/modules/registry/*.rs right before
+      # `cargo tauri build` consumes the bundled-modules tree. `stage-modules`
+      # already verifies at download; this closes the gap where the record
+      # pins are updated after staging but before compilation, which would
+      # otherwise ship a bundle the runtime loader refuses with "release is
+      # not cached and downloads are disabled".
+      - name: Verify bundled modules match the compiled registry pins
+        shell: bash
+        run: node scripts/release/verify-bundled-modules.mjs
+
       # Vite is invoked via tauri.conf.json's beforeBuildCommand inside
       # `cargo tauri build`, so all VITE_* env must be present here for the
       # bundle to bake them in. macOS signing is intentionally skipped here
