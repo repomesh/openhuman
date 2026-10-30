@@ -37,66 +37,61 @@ jobs:
           node-version: 24.x
       - name: Check registry coverage
         run: node --test scripts/__tests__/stage-modules.test.mjs
-      # The windows-latest runner image ships Visual Studio with the x64 build
-      # tools and their redist, but NOT the ARM64 ones. stage-modules now ships
-      # vcruntime140.dll beside each Windows module to close issue #8499 /
-      # Sentry TAURI-RUST-14J5, so the ARM64 host_key needs an arm64 CRT on the
-      # build host. The cleanest provisioning path is to add the ARM64 build
-      # tools component to the installed VS via `vs_installer modify`; that
-      # drops the arm64 CRT into VC\Redist\MSVC\<version>\arm64\, where the
-      # existing `findWindowsVcRuntimeDir` + vswhere lookup finds it. Earlier
-      # attempts via `vc_redist.arm64.exe /layout` failed on the x64 runner
-      # (empty exit code; the installer appears to refuse a cross-arch layout
-      # on this host).
-      - name: Install Visual Studio ARM64 build tools (app-local VC runtime source)
+      # Extract the ARM64 vcruntime140.dll from Microsoft's canonical
+      # redistributable installer. windows-latest ships VS with the x64 build
+      # tools and their redist, but NOT the ARM64 variants, and `stage-modules`
+      # needs an arm64 vcruntime140.dll to ship beside each ARM64 module
+      # (issue #8499 / Sentry TAURI-RUST-14J5). Earlier attempts via
+      # `vs_installer modify --add VC.Tools.ARM64` and `vc_redist.arm64.exe
+      # /layout` both failed on this x64 host — the modify path returned a
+      # generic non-zero exit after downloading channel manifests, and /layout
+      # exited with no code. The reliable path is to decompose Microsoft's
+      # vc_redist installer, which is a WiX Burn bundle, with 7-Zip (shipped
+      # pre-installed on windows-latest). 7z reads Burn bundles and MSIs
+      # natively; we extract the DLL and point OPENHUMAN_VC_REDIST_DIR at its
+      # directory, which the staging code already supports (and which the
+      # arch-match check in `assertRuntimeMatchesHost` validates).
+      - name: Extract ARM64 Visual C++ runtime from vc_redist (app-local staging source)
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
-          $installPath = & $vswhere -latest -products '*' -property installationPath
-          if (-not $installPath) { throw 'no Visual Studio installation detected' }
-          Write-Host "Modifying VS installation at $installPath"
-          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-          if (-not (Test-Path $vsInstaller)) { throw "vs_installer.exe not found at $vsInstaller" }
-          # Pin exit codes we accept: 0 (success), 862/1641/3010 (install
-          # succeeded but requested a reboot — fine for file-level use).
-          $allowed = @(0, 862, 1641, 3010)
-          # vs_installer.exe is a GUI-subsystem executable; the PowerShell call
-          # operator can return before it finishes, so $LASTEXITCODE would be
-          # read before the ARM64 CRT is actually on disk. Start-Process
-          # -Wait -PassThru blocks until the process exits and gives us the
-          # real exit code to gate on. `--wait` is omitted from vs_installer's
-          # own args — in modify mode on VS 2026 it can trigger exit 87
-          # (ERROR_INVALID_PARAMETER), and Start-Process -Wait already
-          # provides the semantics we need.
-          $stdoutLog = Join-Path $env:RUNNER_TEMP 'vs_installer.stdout.log'
-          $stderrLog = Join-Path $env:RUNNER_TEMP 'vs_installer.stderr.log'
-          $proc = Start-Process -FilePath $vsInstaller -Wait -PassThru -NoNewWindow `
-            -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog `
-            -ArgumentList @(
-              'modify',
-              '--quiet', '--norestart',
-              '--installPath', $installPath,
-              '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
-            )
-          if ($allowed -notcontains $proc.ExitCode) {
-            Write-Host '--- vs_installer stdout ---'
-            if (Test-Path $stdoutLog) { Get-Content $stdoutLog | Write-Host }
-            Write-Host '--- vs_installer stderr ---'
-            if (Test-Path $stderrLog) { Get-Content $stderrLog | Write-Host }
-            # vs_installer writes dated log files to %TEMP%\dd_installer_*.log.
-            # Surface the most recent one so the real failure reason reaches
-            # the CI log instead of only the exit code.
-            $log = Get-ChildItem -Path $env:TEMP -Filter 'dd_installer_*.log' -ErrorAction SilentlyContinue |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($log) {
-              Write-Host "--- $($log.FullName) (tail) ---"
-              Get-Content $log.FullName -Tail 100 | Write-Host
-            }
-            throw "vs_installer modify failed: $($proc.ExitCode)"
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { throw "7z.exe not found at $sevenZip" }
+          $url = 'https://aka.ms/vs/17/release/vc_redist.arm64.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'vc_redist.arm64.exe'
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          # Burn-bundle unpack: 7z reads vc_redist.arm64.exe directly and
+          # emits the inner MSIs/CABs beneath $burn.
+          $burn = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-burn'
+          & $sevenZip x "-o$burn" -y $exe | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z expand of vc_redist.arm64.exe failed: $LASTEXITCODE" }
+          # The Burn bundle lays MSIs beside its own files; each one carries
+          # redist DLLs as embedded CABs. Expand every MSI and search for
+          # vcruntime140.dll.
+          $msiOut = Join-Path $env:RUNNER_TEMP 'vcrt-arm64-msi'
+          New-Item -ItemType Directory -Force $msiOut | Out-Null
+          Get-ChildItem -Recurse $burn -Filter '*.msi' | ForEach-Object {
+            $target = Join-Path $msiOut ($_.BaseName)
+            New-Item -ItemType Directory -Force $target | Out-Null
+            & $sevenZip x "-o$target" -y $_.FullName | Out-Null
           }
-          Write-Host "vs_installer modify finished (exit $($proc.ExitCode)); ARM64 CRT should now be under VC\Redist\MSVC\*\arm64\"
+          # 7z extracts MSI tables as named files; the DLL payload sits under
+          # Binary.* or File.* with the real name in the MSI table — but 7z
+          # exposes files by their canonical names in later versions.
+          $dll = Get-ChildItem -Recurse $msiOut -Filter 'vcruntime140.dll' |
+            Where-Object { $_.Length -gt 10000 } |
+            Select-Object -First 1
+          if (-not $dll) {
+            Write-Host '--- Burn bundle contents ---'
+            Get-ChildItem -Recurse $burn | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host '--- MSI contents ---'
+            Get-ChildItem -Recurse $msiOut | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
+            throw 'vcruntime140.dll not found after extracting vc_redist.arm64.exe'
+          }
+          Write-Host "Extracted ARM64 vcruntime140.dll to $($dll.FullName) ($($dll.Length) bytes)"
+          # OPENHUMAN_VC_REDIST_DIR expects a directory containing the DLL by
+          # its unqualified name — point at the dll's own parent dir.
+          "OPENHUMAN_VC_REDIST_DIR=$($dll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Download and verify every bundled release
         run: node scripts/release/stage-modules.mjs --target ${{ matrix.target }}
