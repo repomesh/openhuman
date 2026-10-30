@@ -285,6 +285,11 @@ export function findWindowsVcRuntimeDir(hostKey) {
     throw new Error(`findWindowsVcRuntimeDir called with non-Windows host_key ${hostKey}`);
   }
   const arch = vcRuntimeArch(hostKey);
+  // Grep-friendly prefix for every resolution outcome so a CI failure that
+  // traces back to the wrong CRT (older VC14x, Spectre-adjacent, ARM64 mix-up)
+  // is one `grep` away in the job log.
+  const log = (branch, dir) =>
+    console.log(`[bundled-modules] VC runtime for ${hostKey}: ${branch} -> ${dir}`);
 
   const override = process.env.OPENHUMAN_VC_REDIST_DIR;
   if (override) {
@@ -293,13 +298,17 @@ export function findWindowsVcRuntimeDir(hostKey) {
         `OPENHUMAN_VC_REDIST_DIR=${override} does not contain ${WINDOWS_APP_LOCAL_RUNTIME_FILES[0]}`,
       );
     }
+    log("OPENHUMAN_VC_REDIST_DIR", override);
     return override;
   }
 
   const toolsRedist = process.env.VCToolsRedistDir;
   if (toolsRedist) {
     const crtDir = join(toolsRedist, arch, "Microsoft.VC143.CRT");
-    if (existsSync(join(crtDir, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return crtDir;
+    if (existsSync(join(crtDir, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) {
+      log("VCToolsRedistDir", crtDir);
+      return crtDir;
+    }
   }
 
   if (process.platform !== "win32") {
@@ -366,7 +375,10 @@ export function findWindowsVcRuntimeDir(hostKey) {
     const archDir = join(redistRoot, version, arch);
     if (!existsSync(archDir)) continue;
     const fastPath = join(archDir, "Microsoft.VC143.CRT");
-    if (existsSync(join(fastPath, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return fastPath;
+    if (existsSync(join(fastPath, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) {
+      log("vswhere+VC143.CRT", fastPath);
+      return fastPath;
+    }
     for (const entry of readdirSync(archDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       // Prefer non-Spectre CRT subdirs so we never ship Spectre-mitigated bits
@@ -374,7 +386,10 @@ export function findWindowsVcRuntimeDir(hostKey) {
       // ABI-identical for app-local deployment).
       if (!/^Microsoft\.VC14[0-9]+\.CRT$/.test(entry.name)) continue;
       const candidate = join(archDir, entry.name);
-      if (existsSync(join(candidate, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return candidate;
+      if (existsSync(join(candidate, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) {
+        log(`vswhere+${entry.name}`, candidate);
+        return candidate;
+      }
     }
   }
   throw new Error(
