@@ -19,6 +19,8 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -39,6 +41,20 @@ import {
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const OUTPUT = join(ROOT, "crates/openhuman-app/bundled-modules");
 const LIBRARY_EXTENSIONS = [".dll", ".so", ".dylib"];
+
+// Visual C++ runtime files that must ship beside every Windows module. tinybus
+// loads with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+// so Windows resolves dependencies only beside the module and in System32 —
+// never PATH, never the app folder, never a sibling module's dir. VCRUNTIME140
+// is not in System32 by default on fresh Windows 10/11, so without this file
+// a user without the VC++ 2015-2022 Redistributable installed gets a terminal
+// load failure (`dynamic loader rejected the artifact — Win32 error 126`,
+// Sentry TAURI-RUST-14J5 / issue #8499). Universal CRT shims
+// (`api-ms-win-crt-*.dll`, `ucrtbase.dll`) ship with the OS on Windows 10+
+// and need no app-local copy. Keep this list minimal — every entry inflates
+// each Windows host_key by its byte count and must be license-compliant for
+// app-local redistribution.
+const WINDOWS_APP_LOCAL_RUNTIME_FILES = ["vcruntime140.dll"];
 
 /** The registry host key to bundle for a Node `platform`/`arch` pair. */
 export function defaultHostKey(platform = process.platform, arch = process.arch) {
@@ -121,10 +137,134 @@ function librariesUnder(dir) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) return librariesUnder(path);
     const name = entry.name.toLowerCase();
+    // App-local VC runtime files staged by stageWindowsAppLocalRuntime are not
+    // modules; skip them so the "exactly one native library" invariant below
+    // still holds no matter when they're placed in `dir`.
+    if (WINDOWS_APP_LOCAL_RUNTIME_FILES.includes(name)) return [];
     return entry.isFile() && LIBRARY_EXTENSIONS.some((ext) => name.endsWith(ext))
       ? [path]
       : [];
   });
+}
+
+/** True for the Windows release host_keys (e.g. `windows-2022-x86_64`). */
+export function isWindowsHostKey(hostKey) {
+  return hostKey.startsWith("windows-");
+}
+
+/** The redist subfolder name for a Windows host_key's arch. */
+function vcRuntimeArch(hostKey) {
+  return hostKey.endsWith("-arm64") ? "arm64" : "x64";
+}
+
+/**
+ * Resolve the directory on this build host that contains the Visual C++
+ * redistributable DLLs for `hostKey`'s arch. Tried in order:
+ *
+ *  1. `OPENHUMAN_VC_REDIST_DIR` — explicit override; the environment variable
+ *     points at a directory containing the files listed in
+ *     `WINDOWS_APP_LOCAL_RUNTIME_FILES`. Used by CI jobs that assemble the
+ *     redist dir themselves (e.g. extracted from a pinned VC_redist.x64.exe).
+ *  2. `VCToolsRedistDir` — set by a Visual Studio Developer Prompt. Points at
+ *     `.../VC/Redist/MSVC/<version>/`; the per-arch `Microsoft.VC143.CRT` dir
+ *     under it holds the files.
+ *  3. `vswhere.exe` — probes the installed Visual Studio and walks
+ *     `VC/Redist/MSVC/<newest>/<arch>/Microsoft.VC143.CRT`. Windows build host
+ *     only; the probe is skipped elsewhere so a cross-build from Linux fails
+ *     fast with an actionable message rather than silently shipping no runtime.
+ *
+ * Throws with a message that names the fix on every miss.
+ */
+export function findWindowsVcRuntimeDir(hostKey) {
+  if (!isWindowsHostKey(hostKey)) {
+    throw new Error(`findWindowsVcRuntimeDir called with non-Windows host_key ${hostKey}`);
+  }
+  const arch = vcRuntimeArch(hostKey);
+
+  const override = process.env.OPENHUMAN_VC_REDIST_DIR;
+  if (override) {
+    if (!existsSync(join(override, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) {
+      throw new Error(
+        `OPENHUMAN_VC_REDIST_DIR=${override} does not contain ${WINDOWS_APP_LOCAL_RUNTIME_FILES[0]}`,
+      );
+    }
+    return override;
+  }
+
+  const toolsRedist = process.env.VCToolsRedistDir;
+  if (toolsRedist) {
+    const crtDir = join(toolsRedist, arch, "Microsoft.VC143.CRT");
+    if (existsSync(join(crtDir, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return crtDir;
+  }
+
+  if (process.platform !== "win32") {
+    throw new Error(
+      `cannot locate the Windows VC++ runtime for ${hostKey} on a ${process.platform} build host. ` +
+        `Set OPENHUMAN_VC_REDIST_DIR to a directory containing ${WINDOWS_APP_LOCAL_RUNTIME_FILES.join(", ")} ` +
+        `(e.g. extracted from VC_redist.x64.exe), or stage on a Windows runner where VCToolsRedistDir is set.`,
+    );
+  }
+
+  const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+  const vswhere = join(programFilesX86, "Microsoft Visual Studio", "Installer", "vswhere.exe");
+  if (!existsSync(vswhere)) {
+    throw new Error(
+      `${vswhere} not found; install Visual Studio Build Tools on the Windows runner, or set ` +
+        `OPENHUMAN_VC_REDIST_DIR to a directory containing ${WINDOWS_APP_LOCAL_RUNTIME_FILES.join(", ")}.`,
+    );
+  }
+  const installPath = execFileSync(vswhere, ["-latest", "-property", "installationPath"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+  }).trim();
+  if (!installPath) throw new Error("vswhere.exe reported no Visual Studio installation");
+
+  const redistRoot = join(installPath, "VC", "Redist", "MSVC");
+  if (!existsSync(redistRoot)) {
+    throw new Error(
+      `${redistRoot} missing; install the "MSVC v143 - VS 2022 C++ x64/x86 build tools" workload or set OPENHUMAN_VC_REDIST_DIR.`,
+    );
+  }
+  // Newest redist version wins; VC143 is the current ABI shipped since VS 2022.
+  const versions = readdirSync(redistRoot, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  for (const version of versions) {
+    const crtDir = join(redistRoot, version, arch, "Microsoft.VC143.CRT");
+    if (existsSync(join(crtDir, WINDOWS_APP_LOCAL_RUNTIME_FILES[0]))) return crtDir;
+  }
+  throw new Error(
+    `no Microsoft.VC143.CRT/${WINDOWS_APP_LOCAL_RUNTIME_FILES[0]} under ${redistRoot}`,
+  );
+}
+
+/**
+ * Place `WINDOWS_APP_LOCAL_RUNTIME_FILES` beside the staged module library on
+ * Windows. No-op on other host_keys. Returns the staged absolute paths.
+ *
+ * This closes issue #8499 / Sentry TAURI-RUST-14J5: before this step the
+ * installer shipped tinyconnectors.dll (and every other `windows-*` tiny
+ * module) alone; the tinybus loader uses LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+ * | LOAD_LIBRARY_SEARCH_SYSTEM32, which only resolves dependencies beside the
+ * module or in System32. On a user without VC++ 2015-2022 Redistributable
+ * installed, VCRUNTIME140.dll is in neither place and `LoadLibraryExW`
+ * returns NULL with GetLastError() == 126.
+ */
+export function stageWindowsAppLocalRuntime(dir, hostKey) {
+  if (!isWindowsHostKey(hostKey)) return [];
+  const source = findWindowsVcRuntimeDir(hostKey);
+  const copied = [];
+  for (const name of WINDOWS_APP_LOCAL_RUNTIME_FILES) {
+    const src = join(source, name);
+    if (!existsSync(src)) {
+      throw new Error(`VC runtime file missing: ${src}`);
+    }
+    const dst = join(dir, name);
+    copyFileSync(src, dst);
+    copied.push(dst);
+  }
+  return copied;
 }
 
 export function extractWindowsZip(archive, dir) {
@@ -231,8 +371,14 @@ export async function stageModules({
     if (librariesUnder(dir).length !== 1) {
       throw new Error(`${asset.id}: expected exactly one native library in the release archive`);
     }
+    // Windows-only: ship vcruntime140.dll beside the module (see
+    // stageWindowsAppLocalRuntime for the loader-flags rationale).
+    const runtime = stageWindowsAppLocalRuntime(dir, asset.hostKey);
     if (!keepsArchive(asset.hostKey)) replaceArchiveWithMarker(archive, actual);
-    console.log(`[bundled-modules] staged ${asset.id} ${asset.version} (${asset.hostKey})`);
+    const runtimeNote = runtime.length ? ` + ${runtime.length} runtime file(s)` : "";
+    console.log(
+      `[bundled-modules] staged ${asset.id} ${asset.version} (${asset.hostKey})${runtimeNote}`,
+    );
   }
   normalizeStagedPermissions(output);
   console.log(`[bundled-modules] staged ${assets.length} verified releases for ${hostKey}`);
